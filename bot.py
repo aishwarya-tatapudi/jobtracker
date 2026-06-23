@@ -28,7 +28,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "jobs.db")
+DB_PATH = os.environ.get("DB_PATH", os.path.join(os.path.dirname(__file__), "jobs.db"))
 anthropic = Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
 VALID_STATUSES = ["applied", "phone screen", "interview", "offer", "rejected", "withdrawn"]
@@ -372,6 +372,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _, job_id_str, status = data.split(":", 2)
         job_id = int(job_id_str)
         job = get_job(job_id)
+        if not job:
+            await query.edit_message_text("Job not found — it may have been deleted.")
+            return
         set_status(job_id, status)
         emoji = STATUS_EMOJI.get(status, "")
         await query.edit_message_text(
