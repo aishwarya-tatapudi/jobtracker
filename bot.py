@@ -1,7 +1,5 @@
 """
 Telegram Job Link Parser Bot
-Send any job posting URL — the bot extracts title, company, and contact
-info, saves it with status "applied" and the date you sent the link.
 """
 
 import os
@@ -10,17 +8,17 @@ import sqlite3
 import csv
 import io
 import logging
-from datetime import datetime, date, timedelta
+from datetime import datetime
 
 import requests
 from bs4 import BeautifulSoup
 from anthropic import Anthropic
-from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
-    ConversationHandler,
+    CallbackQueryHandler,
     ContextTypes,
     filters,
 )
@@ -44,16 +42,12 @@ STATUS_EMOJI = {
     "withdrawn":    "🚫",
 }
 
-# ConversationHandler states
-ASK_DATE, ASK_JOB, ASK_NEW_STATUS = range(3)
-
 
 # ---------------------------------------------------------------------------
 # Markdown helper
 # ---------------------------------------------------------------------------
 
 def escape_md(text) -> str:
-    """Escape text for Telegram MarkdownV2."""
     return re.sub(r'([_*\[\]()~`>#\+\-=|{}.!\\])', r'\\\1', str(text or ""))
 
 
@@ -90,10 +84,8 @@ def init_db():
         conn.commit()
 
 
-def save_job(
-    title, company, url, sent_at,
-    contact_name="", contact_email="", contact_phone="", contact_linkedin="",
-):
+def save_job(title, company, url, sent_at,
+             contact_name="", contact_email="", contact_phone="", contact_linkedin=""):
     with sqlite3.connect(DB_PATH) as conn:
         cur = conn.execute(
             """INSERT OR IGNORE INTO jobs
@@ -107,11 +99,9 @@ def save_job(
         return cur.lastrowid or 0
 
 
-def update_status(job_id: int, status: str) -> bool:
+def set_status(job_id: int, status: str) -> bool:
     with sqlite3.connect(DB_PATH) as conn:
-        cur = conn.execute(
-            "UPDATE jobs SET status = ? WHERE id = ?", (status, job_id)
-        )
+        cur = conn.execute("UPDATE jobs SET status = ? WHERE id = ?", (status, job_id))
         conn.commit()
         return cur.rowcount > 0
 
@@ -128,17 +118,6 @@ def list_jobs(status_filter: str = "") -> list[dict]:
             rows = conn.execute(
                 "SELECT * FROM jobs ORDER BY sent_at DESC"
             ).fetchall()
-        return [dict(r) for r in rows]
-
-
-def jobs_on_date(day: str) -> list[dict]:
-    """Return jobs whose sent_at starts with the given YYYY-MM-DD date."""
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.row_factory = sqlite3.Row
-        rows = conn.execute(
-            "SELECT * FROM jobs WHERE sent_at LIKE ? ORDER BY sent_at DESC",
-            (f"{day}%",),
-        ).fetchall()
         return [dict(r) for r in rows]
 
 
@@ -197,24 +176,21 @@ def extract_job_info(page_text: str, url: str) -> dict:
     message = anthropic.messages.create(
         model="claude-haiku-4-5-20251001",
         max_tokens=400,
-        messages=[
-            {
-                "role": "user",
-                "content": (
-                    "From the job posting page content below, extract the following.\n"
-                    "If a field is not found, write 'N/A' for it.\n\n"
-                    "Reply in this EXACT format and nothing else:\n"
-                    "TITLE: <job title>\n"
-                    "COMPANY: <hiring company name, NOT the ATS vendor>\n"
-                    "CONTACT_NAME: <recruiter or hiring manager name>\n"
-                    "CONTACT_EMAIL: <recruiter or contact email>\n"
-                    "CONTACT_PHONE: <recruiter or contact phone number>\n"
-                    "CONTACT_LINKEDIN: <LinkedIn profile URL of the contact>\n\n"
-                    f"URL: {url}\n\n"
-                    f"{page_text}"
-                ),
-            }
-        ],
+        messages=[{
+            "role": "user",
+            "content": (
+                "From the job posting page content below, extract the following.\n"
+                "If a field is not found, write 'N/A' for it.\n\n"
+                "Reply in this EXACT format and nothing else:\n"
+                "TITLE: <job title>\n"
+                "COMPANY: <hiring company name, NOT the ATS vendor>\n"
+                "CONTACT_NAME: <recruiter or hiring manager name>\n"
+                "CONTACT_EMAIL: <recruiter or contact email>\n"
+                "CONTACT_PHONE: <recruiter or contact phone number>\n"
+                "CONTACT_LINKEDIN: <LinkedIn profile URL of the contact>\n\n"
+                f"URL: {url}\n\n{page_text}"
+            ),
+        }],
     )
     text = message.content[0].text.strip()
     fields = {
@@ -233,6 +209,43 @@ def extract_job_info(page_text: str, url: str) -> dict:
                 value = line.removeprefix(f"{prefix}:").strip()
                 fields[field] = "" if value == "N/A" else value
     return fields
+
+
+# ---------------------------------------------------------------------------
+# Inline keyboard builders
+# ---------------------------------------------------------------------------
+
+def status_keyboard(job_id: int) -> InlineKeyboardMarkup:
+    """One button per status, each sets that status on the job."""
+    rows = [
+        [InlineKeyboardButton(
+            f"{STATUS_EMOJI[s]} {s.title()}",
+            callback_data=f"set:{job_id}:{s}"
+        )]
+        for s in VALID_STATUSES
+    ]
+    rows.append([InlineKeyboardButton("✖ Cancel", callback_data="cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
+def job_picker_keyboard(jobs: list[dict]) -> InlineKeyboardMarkup:
+    """One button per job, leads to status picker."""
+    rows = [
+        [InlineKeyboardButton(
+            f"{STATUS_EMOJI.get(j['status'], '📤')} {j['title']} — {j['company']}",
+            callback_data=f"pick:{j['id']}"
+        )]
+        for j in jobs
+    ]
+    rows.append([InlineKeyboardButton("✖ Cancel", callback_data="cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
+def update_status_button(job_id: int) -> InlineKeyboardMarkup:
+    """Single button shown right after saving a job."""
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("📝 Update Status", callback_data=f"pick:{job_id}")
+    ]])
 
 
 # ---------------------------------------------------------------------------
@@ -262,36 +275,20 @@ def format_job(j: dict, show_url: bool = True) -> str:
     return "\n".join(lines)
 
 
-def parse_date_input(text: str) -> str | None:
-    """Parse 'today', 'yesterday', or YYYY-MM-DD. Returns YYYY-MM-DD or None."""
-    text = text.strip().lower()
-    if text == "today":
-        return date.today().strftime("%Y-%m-%d")
-    if text == "yesterday":
-        return (date.today() - timedelta(days=1)).strftime("%Y-%m-%d")
-    try:
-        datetime.strptime(text, "%Y-%m-%d")
-        return text
-    except ValueError:
-        return None
-
-
 # ---------------------------------------------------------------------------
-# Telegram handlers
+# Handlers
 # ---------------------------------------------------------------------------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Hi\! Send me any job posting link and I'll save it as *applied*\.\n\n"
         "*Commands:*\n"
+        "/status — update a job's status\n"
         "/list — all saved jobs\n"
         "/list <status> — filter by status\n"
         "/job <id> — full details for one job\n"
-        "/status — update a job's status\n"
         "/export — download all jobs as CSV\n"
-        "/delete <id> — remove a job\n\n"
-        "*Valid statuses:*\n"
-        "applied · phone screen · interview · offer · rejected · withdrawn",
+        "/delete <id> — remove a job",
         parse_mode="MarkdownV2",
     )
 
@@ -302,9 +299,11 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not urls:
         await update.message.reply_text("Please send a valid job posting URL.")
         return
+
     url = urls[0]
     sent_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
     msg = await update.message.reply_text("Fetching job details...")
+
     try:
         page_text = fetch_page_text(url)
         info = extract_job_info(page_text, url)
@@ -312,124 +311,74 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error("Failed to parse %s: %s", url, exc)
         await msg.edit_text(f"Could not parse that page: {exc}")
         return
+
     job_id = save_job(
         title=info["title"], company=info["company"],
         url=url, sent_at=sent_at,
         contact_name=info["contact_name"], contact_email=info["contact_email"],
         contact_phone=info["contact_phone"], contact_linkedin=info["contact_linkedin"],
     )
+
     if job_id == 0:
-        await msg.edit_text(
-            f"Already saved: *{escape_md(info['title'])}* at *{escape_md(info['company'])}*",
+        job = list_jobs()  # find existing
+        existing = next((j for j in job if j["url"] == url), None)
+        reply = f"Already saved: *{escape_md(info['title'])}* at *{escape_md(info['company'])}*"
+        kb = update_status_button(existing["id"]) if existing else None
+        await msg.edit_text(reply, parse_mode="MarkdownV2", reply_markup=kb)
+        return
+
+    job = get_job(job_id)
+    await msg.edit_text(
+        f"Saved\!\n\n{format_job(job)}",
+        parse_mode="MarkdownV2",
+        reply_markup=update_status_button(job_id),
+    )
+
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    jobs = list_jobs()[:15]
+    if not jobs:
+        await update.message.reply_text("No jobs saved yet.")
+        return
+    await update.message.reply_text(
+        "Which job do you want to update?",
+        reply_markup=job_picker_keyboard(jobs),
+    )
+
+
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    if data == "cancel":
+        await query.edit_message_reply_markup(reply_markup=None)
+        return
+
+    if data.startswith("pick:"):
+        job_id = int(data.split(":")[1])
+        job = get_job(job_id)
+        if not job:
+            await query.edit_message_text("Job not found.")
+            return
+        await query.edit_message_text(
+            f"*{escape_md(job['title'])}* — {escape_md(job['company'])}\n\nChoose new status:",
+            parse_mode="MarkdownV2",
+            reply_markup=status_keyboard(job_id),
+        )
+        return
+
+    if data.startswith("set:"):
+        _, job_id_str, status = data.split(":", 2)
+        job_id = int(job_id_str)
+        job = get_job(job_id)
+        set_status(job_id, status)
+        emoji = STATUS_EMOJI.get(status, "")
+        await query.edit_message_text(
+            f"{emoji} *{escape_md(job['title'])}* marked as *{escape_md(status.title())}*",
             parse_mode="MarkdownV2",
         )
-        return
-    job = get_job(job_id)
-    await msg.edit_text(f"Saved\!\n\n{format_job(job)}", parse_mode="MarkdownV2")
 
-
-async def cmd_job(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = context.args
-    if not args or not args[0].isdigit():
-        await update.message.reply_text("Usage: /job <id>")
-        return
-    job = get_job(int(args[0]))
-    if not job:
-        await update.message.reply_text("No job found with that ID.")
-        return
-    await update.message.reply_text(format_job(job), parse_mode="MarkdownV2")
-
-
-# -----------  Interactive /status conversation  -----------
-
-async def cmd_status_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "What date did you apply? Reply with:\n"
-        "• today\n"
-        "• yesterday\n"
-        "• a date like 2026-06-23",
-        reply_markup=ReplyKeyboardMarkup(
-            [["today", "yesterday"]], one_time_keyboard=True, resize_keyboard=True
-        ),
-    )
-    return ASK_DATE
-
-
-async def received_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    day = parse_date_input(update.message.text or "")
-    if not day:
-        await update.message.reply_text(
-            "Didn't recognise that date. Try 'today', 'yesterday', or YYYY-MM-DD."
-        )
-        return ASK_DATE
-
-    jobs = jobs_on_date(day)
-    if not jobs:
-        await update.message.reply_text(
-            f"No jobs found for {day}.",
-            reply_markup=ReplyKeyboardRemove(),
-        )
-        return ConversationHandler.END
-
-    context.user_data["status_jobs"] = jobs
-    lines = [f"{i+1}. {j['title']} — {j['company']}" for i, j in enumerate(jobs)]
-    keyboard = [[str(i + 1)] for i in range(len(jobs))]
-    await update.message.reply_text(
-        f"Jobs applied on {day}:\n\n" + "\n".join(lines) + "\n\nPick a number:",
-        reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True),
-    )
-    return ASK_JOB
-
-
-async def received_job_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (update.message.text or "").strip()
-    jobs = context.user_data.get("status_jobs", [])
-    if not text.isdigit() or not (1 <= int(text) <= len(jobs)):
-        await update.message.reply_text(f"Please pick a number between 1 and {len(jobs)}.")
-        return ASK_JOB
-
-    chosen = jobs[int(text) - 1]
-    context.user_data["status_job_id"] = chosen["id"]
-
-    keyboard = [[s] for s in VALID_STATUSES]
-    await update.message.reply_text(
-        f"Updating: *{chosen['title']}* — {chosen['company']}\n\nNew status?",
-        parse_mode="Markdown",
-        reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True),
-    )
-    return ASK_NEW_STATUS
-
-
-async def received_new_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    new_status = (update.message.text or "").strip().lower()
-    job_id = context.user_data.get("status_job_id")
-
-    if new_status not in VALID_STATUSES:
-        await update.message.reply_text(
-            f"Unknown status. Pick one: {', '.join(VALID_STATUSES)}"
-        )
-        return ASK_NEW_STATUS
-
-    if update_status(job_id, new_status):
-        emoji = STATUS_EMOJI[new_status]
-        await update.message.reply_text(
-            f"Updated to {emoji} {new_status.title()}",
-            reply_markup=ReplyKeyboardRemove(),
-        )
-    else:
-        await update.message.reply_text("Something went wrong.", reply_markup=ReplyKeyboardRemove())
-
-    context.user_data.clear()
-    return ConversationHandler.END
-
-
-async def cancel_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
-    await update.message.reply_text("Cancelled.", reply_markup=ReplyKeyboardRemove())
-    return ConversationHandler.END
-
-
-# -----------  Other commands  -----------
 
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status_filter = " ".join(context.args).lower() if context.args else ""
@@ -454,6 +403,22 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chunks.append("\n\n".join(chunk))
     for part in chunks:
         await update.message.reply_text(part, parse_mode="MarkdownV2")
+
+
+async def cmd_job(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if not args or not args[0].isdigit():
+        await update.message.reply_text("Usage: /job <id>")
+        return
+    job = get_job(int(args[0]))
+    if not job:
+        await update.message.reply_text("No job found with that ID.")
+        return
+    await update.message.reply_text(
+        format_job(job),
+        parse_mode="MarkdownV2",
+        reply_markup=update_status_button(job["id"]),
+    )
 
 
 async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -494,25 +459,14 @@ def main():
     token = os.environ["TELEGRAM_BOT_TOKEN"]
     init_db()
     app = Application.builder().token(token).build()
-
-    status_conv = ConversationHandler(
-        entry_points=[CommandHandler("status", cmd_status_start)],
-        states={
-            ASK_DATE:       [MessageHandler(filters.TEXT & ~filters.COMMAND, received_date)],
-            ASK_JOB:        [MessageHandler(filters.TEXT & ~filters.COMMAND, received_job_choice)],
-            ASK_NEW_STATUS: [MessageHandler(filters.TEXT & ~filters.COMMAND, received_new_status)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel_status)],
-    )
-
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("list", cmd_list))
     app.add_handler(CommandHandler("job", cmd_job))
-    app.add_handler(status_conv)
     app.add_handler(CommandHandler("export", cmd_export))
     app.add_handler(CommandHandler("delete", cmd_delete))
+    app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
-
     logger.info("Bot started.")
     app.run_polling()
 
