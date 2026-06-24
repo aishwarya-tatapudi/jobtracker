@@ -8,7 +8,15 @@ import sqlite3
 import csv
 import io
 import logging
-from datetime import datetime
+import smtplib
+import ssl
+from datetime import datetime, timedelta
+from email.mime.multipart import MIMEMultipart
+from email.mime.base import MIMEBase
+from email.mime.text import MIMEText
+from email import encoders
+
+import openpyxl
 
 import requests
 from bs4 import BeautifulSoup
@@ -455,6 +463,108 @@ async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------------------------
+# Follow-up email
+# ---------------------------------------------------------------------------
+
+FOLLOWUP_DAYS = 10.5  # 1.5 weeks
+
+
+def jobs_needing_followup() -> list[dict]:
+    """Jobs still in 'applied' status older than FOLLOWUP_DAYS."""
+    cutoff = datetime.utcnow() - timedelta(days=FOLLOWUP_DAYS)
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT * FROM jobs WHERE status = 'applied' ORDER BY sent_at ASC"
+        ).fetchall()
+    result = []
+    for row in rows:
+        d = dict(row)
+        try:
+            applied = datetime.strptime(d["sent_at"], "%Y-%m-%d %H:%M UTC")
+            if applied < cutoff:
+                result.append(d)
+        except ValueError:
+            pass
+    return result
+
+
+def build_excel(jobs: list[dict]) -> bytes:
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Follow Up"
+    headers = ["Company", "Job Title", "Date Applied", "Link"]
+    ws.append(headers)
+    for cell in ws[1]:
+        cell.font = openpyxl.styles.Font(bold=True)
+    for j in jobs:
+        ws.append([
+            j.get("company", ""),
+            j.get("title", ""),
+            j.get("sent_at", ""),
+            j.get("url", ""),
+        ])
+    # Auto-width
+    for col in ws.columns:
+        width = max(len(str(cell.value or "")) for cell in col) + 4
+        ws.column_dimensions[col[0].column_letter].width = min(width, 60)
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def send_followup_email(jobs: list[dict]):
+    gmail_user = os.environ.get("GMAIL_USER")
+    gmail_pass = os.environ.get("GMAIL_APP_PASSWORD")
+    alert_email = os.environ.get("ALERT_EMAIL")
+
+    if not all([gmail_user, gmail_pass, alert_email]):
+        logger.warning("Email env vars not set — skipping follow-up email.")
+        return
+
+    subject = f"Job Follow-Up Reminder: {len(jobs)} application(s) need attention"
+    body = (
+        f"Hi,\n\n"
+        f"The following {len(jobs)} job application(s) have been in 'applied' status "
+        f"for more than 1.5 weeks with no update. Consider following up.\n\n"
+        f"See the attached Excel sheet for details.\n\n"
+        f"— Your Job Tracker Bot"
+    )
+
+    msg = MIMEMultipart()
+    msg["From"] = gmail_user
+    msg["To"] = alert_email
+    msg["Subject"] = subject
+    msg.attach(MIMEText(body, "plain"))
+
+    excel_bytes = build_excel(jobs)
+    part = MIMEBase("application", "octet-stream")
+    part.set_payload(excel_bytes)
+    encoders.encode_base64(part)
+    part.add_header("Content-Disposition", "attachment; filename=followup_jobs.xlsx")
+    msg.attach(part)
+
+    context = ssl.create_default_context()
+    with smtplib.SMTP("smtp.gmail.com", 587) as server:
+        server.starttls(context=context)
+        server.login(gmail_user, gmail_pass)
+        server.sendmail(gmail_user, alert_email, msg.as_string())
+
+    logger.info("Follow-up email sent for %d jobs.", len(jobs))
+
+
+async def daily_followup_check(context):
+    jobs = jobs_needing_followup()
+    if not jobs:
+        logger.info("Follow-up check: no jobs need attention.")
+        return
+    try:
+        send_followup_email(jobs)
+    except Exception as exc:
+        logger.error("Failed to send follow-up email: %s", exc)
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -470,6 +580,10 @@ def main():
     app.add_handler(CommandHandler("delete", cmd_delete))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
+
+    # Check every 24 hours; first run after 60 seconds so startup logs settle
+    app.job_queue.run_repeating(daily_followup_check, interval=86400, first=60)
+
     logger.info("Bot started.")
     app.run_polling()
 
