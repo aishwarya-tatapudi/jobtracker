@@ -319,10 +319,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🔍 Search Jobs — find jobs by company or date\n"
         "📋 List All — show all saved jobs\n\n"
         "*Slash commands also work:*\n"
-        "/list <status> — filter by status\n"
-        "/job <id> — full details for one job\n"
+        "/list \<status\> — filter by status\n"
+        "/job \<id\> — full details for one job\n"
         "/export — download all jobs as CSV\n"
-        "/delete <id> — remove a job",
+        "/delete \<id\> — remove a job",
         parse_mode="MarkdownV2",
         reply_markup=main_menu(),
     )
