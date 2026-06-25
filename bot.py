@@ -21,10 +21,11 @@ import openpyxl
 import requests
 from bs4 import BeautifulSoup
 from anthropic import Anthropic
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
+    ConversationHandler,
     MessageHandler,
     CallbackQueryHandler,
     ContextTypes,
@@ -143,6 +144,16 @@ def delete_job(job_id: int) -> bool:
         return cur.rowcount > 0
 
 
+def search_jobs(query: str) -> list[dict]:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT * FROM jobs WHERE company LIKE ? OR sent_at LIKE ? ORDER BY sent_at DESC",
+            (f"%{query}%", f"{query}%"),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
 # ---------------------------------------------------------------------------
 # Scraping + extraction
 # ---------------------------------------------------------------------------
@@ -256,6 +267,18 @@ def update_status_button(job_id: int) -> InlineKeyboardMarkup:
     ]])
 
 
+def main_menu() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [["➕ Add Job", "📝 Update Status"], ["🔍 Search Jobs", "📋 List All"]],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
+# Conversation state
+SEARCH_WAITING = 0
+
+
 # ---------------------------------------------------------------------------
 # Formatting
 # ---------------------------------------------------------------------------
@@ -289,15 +312,19 @@ def format_job(j: dict, show_url: bool = True) -> str:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Hi\! Send me any job posting link and I'll save it as *applied*\.\n\n"
-        "*Commands:*\n"
-        "/status — update a job's status\n"
-        "/list — all saved jobs\n"
+        "Hi\! Use the menu buttons below or send a job posting URL to save it as *applied*\.\n\n"
+        "*Menu buttons:*\n"
+        "➕ Add Job — prompt to send a URL\n"
+        "📝 Update Status — pick a job and set its status\n"
+        "🔍 Search Jobs — find jobs by company or date\n"
+        "📋 List All — show all saved jobs\n\n"
+        "*Slash commands also work:*\n"
         "/list <status> — filter by status\n"
         "/job <id> — full details for one job\n"
         "/export — download all jobs as CSV\n"
         "/delete <id> — remove a job",
         parse_mode="MarkdownV2",
+        reply_markup=main_menu(),
     )
 
 
@@ -318,6 +345,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as exc:
         logger.error("Failed to parse %s: %s", url, exc)
         await msg.edit_text(f"Could not parse that page: {exc}")
+        await update.message.reply_text("Try another URL or use the menu.", reply_markup=main_menu())
         return
 
     job_id = save_job(
@@ -457,9 +485,89 @@ async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     job_id = int(args[0])
     if delete_job(job_id):
-        await update.message.reply_text(f"Job #{job_id} deleted.")
+        await update.message.reply_text(f"Job \#{job_id} deleted\.", parse_mode="MarkdownV2", reply_markup=main_menu())
     else:
-        await update.message.reply_text(f"No job found with id {job_id}.")
+        await update.message.reply_text(f"No job found with id {job_id}\.", parse_mode="MarkdownV2", reply_markup=main_menu())
+
+
+# ---------------------------------------------------------------------------
+# Menu button handlers
+# ---------------------------------------------------------------------------
+
+async def handle_add_job(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Please send me the job posting URL and I'll extract the details.",
+        reply_markup=main_menu(),
+    )
+
+
+async def handle_update_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    jobs = list_jobs()[:15]
+    if not jobs:
+        await update.message.reply_text("No jobs saved yet.", reply_markup=main_menu())
+        return
+    await update.message.reply_text(
+        "Which job do you want to update?",
+        reply_markup=job_picker_keyboard(jobs),
+    )
+
+
+async def handle_list_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    jobs = list_jobs()
+    if not jobs:
+        await update.message.reply_text("No jobs saved yet.", reply_markup=main_menu())
+        return
+    lines = [format_job(j) for j in jobs]
+    chunk, chunks = [], []
+    for line in lines:
+        if sum(len(l) for l in chunk) + len(line) > 3800:
+            chunks.append("\n\n".join(chunk))
+            chunk = []
+        chunk.append(line)
+    if chunk:
+        chunks.append("\n\n".join(chunk))
+    for i, part in enumerate(chunks):
+        kb = main_menu() if i == len(chunks) - 1 else None
+        await update.message.reply_text(part, parse_mode="MarkdownV2", reply_markup=kb)
+
+
+async def handle_search_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.message.reply_text(
+        "Search by company name or date (e.g. 2026-06):",
+        reply_markup=main_menu(),
+    )
+    return SEARCH_WAITING
+
+
+async def handle_search_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = (update.message.text or "").strip()
+    if URL_RE.search(query):
+        await update.message.reply_text(
+            "That looks like a URL — exiting search. Send it again and I'll save it as a job.",
+            reply_markup=main_menu(),
+        )
+        return ConversationHandler.END
+    jobs = search_jobs(query)
+    if not jobs:
+        await update.message.reply_text(
+            f"No jobs found matching '{escape_md(query)}'\.",
+            parse_mode="MarkdownV2",
+            reply_markup=main_menu(),
+        )
+        return ConversationHandler.END
+    lines = [format_job(j) for j in jobs]
+    chunk, chunks = [], []
+    for line in lines:
+        if sum(len(l) for l in chunk) + len(line) > 3800:
+            chunks.append("\n\n".join(chunk))
+            chunk = []
+        chunk.append(line)
+    if chunk:
+        chunks.append("\n\n".join(chunk))
+    for i, part in enumerate(chunks):
+        kb = main_menu() if i == len(chunks) - 1 else None
+        await update.message.reply_text(part, parse_mode="MarkdownV2", reply_markup=kb)
+    return ConversationHandler.END
 
 
 # ---------------------------------------------------------------------------
@@ -579,6 +687,30 @@ def main():
     app.add_handler(CommandHandler("export", cmd_export))
     app.add_handler(CommandHandler("delete", cmd_delete))
     app.add_handler(CallbackQueryHandler(on_callback))
+
+    # Search conversation — must come before the generic link handler
+    search_conv = ConversationHandler(
+        entry_points=[MessageHandler(
+            filters.TEXT & filters.Regex(r"^🔍 Search Jobs$"),
+            handle_search_start,
+        )],
+        states={
+            SEARCH_WAITING: [MessageHandler(
+                filters.TEXT & ~filters.COMMAND,
+                handle_search_query,
+            )],
+        },
+        fallbacks=[CommandHandler("cancel", lambda u, c: ConversationHandler.END)],
+        allow_reentry=True,
+    )
+    app.add_handler(search_conv)
+
+    # Other menu button handlers
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex(r"^➕ Add Job$"), handle_add_job))
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex(r"^📝 Update Status$"), handle_update_status))
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex(r"^📋 List All$"), handle_list_all))
+
+    # Generic URL/text handler — must be last
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
 
     # Check every 24 hours; first run after 60 seconds so startup logs settle
