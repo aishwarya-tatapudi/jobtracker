@@ -312,18 +312,17 @@ def format_job(j: dict, show_url: bool = True) -> str:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Hi\! Use the menu buttons below or send a job posting URL to save it as *applied*\.\n\n"
-        "*Menu buttons:*\n"
-        "➕ Add Job — prompt to send a URL\n"
-        "📝 Update Status — pick a job and set its status\n"
+        "Hi! Use the menu buttons below or send a job posting URL to save it as 'applied'.\n\n"
+        "Menu buttons:\n"
+        "➕ Add Job — send a URL to save\n"
+        "📝 Update Status — pick a job and change its status\n"
         "🔍 Search Jobs — find jobs by company or date\n"
         "📋 List All — show all saved jobs\n\n"
-        "*Slash commands also work:*\n"
-        "/list \<status\> — filter by status\n"
-        "/job \<id\> — full details for one job\n"
+        "Slash commands also work:\n"
+        "/list [status] — filter by status\n"
+        "/job [id] — full details for one job\n"
         "/export — download all jobs as CSV\n"
-        "/delete \<id\> — remove a job",
-        parse_mode="MarkdownV2",
+        "/delete [id] — remove a job",
         reply_markup=main_menu(),
     )
 
